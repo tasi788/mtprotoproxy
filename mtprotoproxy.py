@@ -120,7 +120,6 @@ def init_config():
             conf_dict["MODES"] = {"classic": False, "secure": False, "tls": True}
 
     conf_dict = {k: v for k, v in conf_dict.items() if k.isupper()}
-
     conf_dict.setdefault("PORT", 3256)
     conf_dict.setdefault("USERS", {"tg":  "00000000000000000000000000000000"})
     conf_dict["AD_TAG"] = bytes.fromhex(conf_dict.get("AD_TAG", ""))
@@ -1758,9 +1757,9 @@ async def handle_metrics(reader, writer):
     global last_clients_with_same_handshake
 
     client_ip = writer.get_extra_info("peername")[0]
-    if client_ip not in config.METRICS_WHITELIST:
-        writer.close()
-        return
+    # if client_ip not in config.METRICS_WHITELIST:
+        # writer.close()
+        # return
 
     try:
         metrics = []
@@ -2294,6 +2293,7 @@ def create_servers(loop):
         os.chmod(config.LISTEN_UNIX_SOCK, 0o666)
 
     if config.METRICS_PORT is not None:
+        print("Starting metrics server on %s:%d" % (config.METRICS_LISTEN_ADDR_IPV4, config.METRICS_PORT), flush=True)
         if config.METRICS_LISTEN_ADDR_IPV4:
             task = asyncio.start_server(handle_metrics, config.METRICS_LISTEN_ADDR_IPV4,
                                         config.METRICS_PORT)
