@@ -482,21 +482,32 @@ myrandom = MyRandom()
 
 
 class TgConnectionPool:
-    MAX_CONNS_IN_POOL = 64
+    MAX_CONNS_IN_POOL = 128  # Increased from 64 for better connection reuse
+    MAX_CONN_AGE = 300  # Maximum connection age in seconds (default 5 minutes)
 
     def __init__(self):
         self.pools = {}
+        self.conn_timestamps = {}  # Track when connections were created
 
     async def open_tg_connection(self, host, port, init_func=None):
         task = asyncio.open_connection(host, port, limit=get_to_clt_bufsize())
         reader_tgt, writer_tgt = await asyncio.wait_for(task, timeout=config.TG_CONNECT_TIMEOUT)
 
-        set_keepalive(writer_tgt.get_extra_info("socket"))
-        set_bufsizes(writer_tgt.get_extra_info("socket"), get_to_clt_bufsize(), get_to_tg_bufsize())
+        sock = writer_tgt.get_extra_info("socket")
+        set_keepalive(sock, interval=30, attempts=3)  # More aggressive keepalive
+        set_nodelay(sock)
+        set_quickack(sock)
+        set_bufsizes(sock, get_to_clt_bufsize(), get_to_tg_bufsize())
 
         if init_func:
-            return await asyncio.wait_for(init_func(host, port, reader_tgt, writer_tgt),
+            result = await asyncio.wait_for(init_func(host, port, reader_tgt, writer_tgt),
                                           timeout=config.TG_CONNECT_TIMEOUT)
+            # Store creation timestamp
+            self.conn_timestamps[id(result[1])] = time.time()
+            return result
+        
+        # Store creation timestamp
+        self.conn_timestamps[id(writer_tgt)] = time.time()
         return reader_tgt, writer_tgt
 
     def register_host_port(self, host, port, init_func):
@@ -506,6 +517,47 @@ class TgConnectionPool:
         while len(self.pools[(host, port, init_func)]) < TgConnectionPool.MAX_CONNS_IN_POOL:
             connect_task = asyncio.ensure_future(self.open_tg_connection(host, port, init_func))
             self.pools[(host, port, init_func)].append(connect_task)
+
+    def is_connection_healthy(self, writer):
+        """Check if connection is actually usable"""
+        if writer.transport.is_closing():
+            return False
+        
+        sock = writer.get_extra_info('socket')
+        if sock is None:
+            return False
+        
+        # Check connection age
+        writer_id = id(writer)
+        if writer_id in self.conn_timestamps:
+            age = time.time() - self.conn_timestamps[writer_id]
+            max_age = getattr(config, 'MAX_CONN_AGE', self.MAX_CONN_AGE)
+            if age > max_age:
+                # Connection too old, discard it
+                del self.conn_timestamps[writer_id]
+                return False
+        
+        try:
+            # Check if socket is still connected using SO_ERROR
+            error = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            if error != 0:
+                return False
+            
+            # Try to peek at the socket to see if it's readable (connection closed)
+            import select
+            readable, _, _ = select.select([sock], [], [], 0)
+            if readable:
+                # If readable but no data sent, connection might be closed
+                try:
+                    data = sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+                    if not data:
+                        return False
+                except (BlockingIOError, socket.error):
+                    pass
+            
+            return True
+        except (OSError, AttributeError):
+            return False
 
     async def get_connection(self, host, port, init_func=None):
         self.register_host_port(host, port, init_func)
@@ -517,13 +569,28 @@ class TgConnectionPool:
                     self.pools[(host, port, init_func)].remove(task)
                     continue
 
-                reader, writer, *other = task.result()
-                if writer.transport.is_closing():
+                try:
+                    reader, writer, *other = task.result()
+                except Exception:
                     self.pools[(host, port, init_func)].remove(task)
+                    continue
+                
+                # Enhanced health check
+                if not self.is_connection_healthy(writer):
+                    self.pools[(host, port, init_func)].remove(task)
+                    try:
+                        writer.transport.abort()
+                    except Exception:
+                        pass
                     continue
 
                 if not ret:
                     self.pools[(host, port, init_func)].remove(task)
+                    # Re-apply TCP optimizations for reused connections
+                    sock = writer.get_extra_info("socket")
+                    if sock:
+                        set_nodelay(sock)
+                        set_quickack(sock)
                     ret = (reader, writer, *other)
 
         self.register_host_port(host, port, init_func)
@@ -973,6 +1040,18 @@ def set_keepalive(sock, interval=40, attempts=5):
         try_setsockopt(sock, socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, interval)
     if hasattr(socket, "TCP_KEEPCNT"):
         try_setsockopt(sock, socket.IPPROTO_TCP, socket.TCP_KEEPCNT, attempts)
+
+
+def set_nodelay(sock):
+    """Disable Nagle's algorithm for lower latency"""
+    if hasattr(socket, "TCP_NODELAY"):
+        try_setsockopt(sock, socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+
+def set_quickack(sock):
+    """Enable TCP quick ACK for faster acknowledgments"""
+    if hasattr(socket, "TCP_QUICKACK"):
+        try_setsockopt(sock, socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
 
 
 def set_ack_timeout(sock, timeout):
@@ -1599,9 +1678,12 @@ async def tg_connect_reader_to_writer(rd, wr, user, rd_buf_size, is_upstream):
 
 
 async def handle_client(reader_clt, writer_clt):
-    set_keepalive(writer_clt.get_extra_info("socket"), config.CLIENT_KEEPALIVE, attempts=3)
-    set_ack_timeout(writer_clt.get_extra_info("socket"), config.CLIENT_ACK_TIMEOUT)
-    set_bufsizes(writer_clt.get_extra_info("socket"), get_to_tg_bufsize(), get_to_clt_bufsize())
+    sock = writer_clt.get_extra_info("socket")
+    set_keepalive(sock, config.CLIENT_KEEPALIVE, attempts=3)
+    set_nodelay(sock)
+    set_quickack(sock)
+    set_ack_timeout(sock, config.CLIENT_ACK_TIMEOUT)
+    set_bufsizes(sock, get_to_tg_bufsize(), get_to_clt_bufsize())
 
     update_stats(connects_all=1)
 
@@ -1819,6 +1901,44 @@ async def handle_metrics(reader, writer):
         traceback.print_exc()
     finally:
         writer.close()
+
+
+async def cleanup_connection_pool():
+    """Periodically clean up stale connections from the pool"""
+    global tg_connection_pool
+    
+    CLEANUP_INTERVAL = 60  # Check every 60 seconds
+    
+    while True:
+        await asyncio.sleep(CLEANUP_INTERVAL)
+        
+        try:
+            cleaned = 0
+            for pool_key, tasks in list(tg_connection_pool.pools.items()):
+                for task in tasks[::]:
+                    if task.done():
+                        try:
+                            if task.exception():
+                                tg_connection_pool.pools[pool_key].remove(task)
+                                cleaned += 1
+                                continue
+                            
+                            reader, writer, *other = task.result()
+                            if not tg_connection_pool.is_connection_healthy(writer):
+                                tg_connection_pool.pools[pool_key].remove(task)
+                                try:
+                                    writer.transport.abort()
+                                except Exception:
+                                    pass
+                                cleaned += 1
+                        except Exception:
+                            tg_connection_pool.pools[pool_key].remove(task)
+                            cleaned += 1
+            
+            if cleaned > 0:
+                print_err(f"Connection pool cleanup: removed {cleaned} stale connections")
+        except Exception as e:
+            print_err(f"Error in connection pool cleanup: {e}")
 
 
 async def stats_printer():
@@ -2311,6 +2431,10 @@ def create_utilitary_tasks(loop):
 
     stats_printer_task = asyncio.Task(stats_printer(), loop=loop)
     tasks.append(stats_printer_task)
+    
+    # Add connection pool cleanup task
+    pool_cleanup_task = asyncio.Task(cleanup_connection_pool(), loop=loop)
+    tasks.append(pool_cleanup_task)
 
     if config.USE_MIDDLE_PROXY:
         middle_proxy_updater_task = asyncio.Task(update_middle_proxy_info(), loop=loop)
